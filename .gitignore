@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Environments and libs
+python_server/libs/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Large media & models
+*.mp4
+*.avi
+*.mkv
+*.pt
+*.pth
+*.onnx
+
+# Cache
+python_server/tts_cache/
+.vscode/
+
+# Ignore artifacts
+*.jsonl
