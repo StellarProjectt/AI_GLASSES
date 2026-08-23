@@ -1,4 +1,7 @@
 flask
-google-generativeai
+google-genai
 gTTS
 Pillow
+opencv-python
+ultralytics
+numpy
