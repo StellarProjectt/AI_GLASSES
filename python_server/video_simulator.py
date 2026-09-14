@@ -32,7 +32,7 @@ import io
 import base64
 import math
 import json
-import tkinter as tk
+# tkinter removed — used osascript for macOS GUI dialogs instead
 from pathlib import Path
 
 # Windows beep (built-in, no install needed)
@@ -52,16 +52,19 @@ GEMINI_API_KEY = os.environ.get(
 )
 
 # YOLO settings
-YOLO_MODEL = "yolo11n.pt"       # nano model (~6MB, fastest)
-YOLO_CONFIDENCE = 0.40          # minimum confidence threshold
-YOLO_IOU = 0.45                 # NMS IoU threshold
-YOLO_PROCESS_EVERY = 1          # run YOLO every N frames (1=every frame, 3=faster)
-YOLO_INPUT_SIZE = 640           # downscale input for YOLO (lower=faster, 640 is default)
+YOLO_MODEL = "models/yolov8s.pt"  # small model — แม่นกว่า nano ~20%, mAP50=0.448
+YOLO_CONFIDENCE = 0.25          # ลด threshold → detect ได้มากขึ้น
+YOLO_IOU = 0.60                 # เพิ่ม IOU → ลด false NMS suppression
+YOLO_PROCESS_EVERY = 1          # run YOLO every N frames (1=every frame)
+YOLO_INPUT_SIZE = 640           # 640 = best speed/accuracy trade-off on CPU (1280 ช้ามาก)
+YOLO_MAX_DET = 50               # max detections per frame
+DISPLAY_WIDTH = 1280            # ระดับ display (วาดบน frame เล็กลงก่อน ประหยัด CPU)
+JSON_WRITE_EVERY = 15           # เขียน JSON ทุก N เฟรม (ไม่จำเป็นเขียนทุกเฟรม)
 
 # Danger zone settings
-DANGER_SIZE_RATIO = 0.30        # object > 30% of frame = very close (imminent)
-WARNING_SIZE_RATIO = 0.15       # object > 15% of frame = getting close
-CENTER_ZONE_RATIO = 0.40        # middle 40% of frame = "in your path"
+DANGER_SIZE_RATIO = 0.25        # object > 25% of frame = very close (imminent)
+WARNING_SIZE_RATIO = 0.10       # object > 10% of frame = getting close
+CENTER_ZONE_RATIO = 0.50        # middle 50% of frame = "in your path" (กว้างขึ้น)
 
 # Head-level hazard (objects white cane can't detect)
 HEAD_LEVEL_THRESHOLD = 0.55     # if object's bottom edge (y2) is above 55% of frame height
@@ -78,9 +81,9 @@ ALWAYS_DANGEROUS = {
 }
 
 # Approach detection settings
-APPROACH_GROWTH_RATE = 0.03     # bbox area grew >3% per frame = approaching
-APPROACH_HISTORY = 8            # track over N frames
-MIN_WARN_SIZE = 0.05            # ignore objects smaller than 5% of frame
+APPROACH_GROWTH_RATE = 0.05     # object grew >5% per frame = approaching (ลด false positive)
+APPROACH_HISTORY = 6            # track over N frames
+MIN_WARN_SIZE = 0.03            # แจ้งเตือนของที่มีขนาด >3% ของเฟรม (ไวขึ้น)
 
 # TTC (Time-To-Collision) settings
 TTC_CRITICAL_SEC = 2.0          # TTC < 2s = immediate danger
@@ -623,7 +626,7 @@ def format_time(seconds):
 
 def speak_thai(text):
     """Play Thai TTS in a background thread"""
-    if not tts_available:
+    if not tts_available or not text or not text.strip():
         return
 
     def _speak():
@@ -908,36 +911,25 @@ def detect_holes_opencv(frame):
 # ==========================================
 # Realtime JSON Analysis Engine
 # ==========================================
-class JSONViewer:
+class JSONFileWriter:
+    """
+    Thread-safe JSON writer — saves realtime analysis to a .json file
+    instead of a tkinter window (which crashes on macOS from background threads).
+    Read the file externally with any JSON viewer / tail -f.
+    """
+    OUTPUT_PATH = Path(__file__).parent / "analysis_realtime.json"
+
     def __init__(self):
-        self.root = None
-        self.text_widget = None
-        self.ready = False
-
-    def run(self):
-        self.root = tk.Tk()
-        self.root.title("Spatial Analysis Engine (Realtime JSON)")
-        self.root.geometry("600x800")
-        
-        self.text_widget = tk.Text(self.root, wrap=tk.NONE, font=("Consolas", 10), bg="#1e1e1e", fg="#d4d4d4")
-        self.text_widget.pack(expand=True, fill='both')
-        
-        v_scroll = tk.Scrollbar(self.text_widget, orient='vertical', command=self.text_widget.yview)
-        v_scroll.pack(side='right', fill='y')
-        self.text_widget.configure(yscrollcommand=v_scroll.set)
-        
         self.ready = True
-        self.root.mainloop()
+        print(f"   📄 Realtime JSON → {self.OUTPUT_PATH}")
 
-    def update_json(self, json_data):
-        if self.ready and self.text_widget:
-            try:
-                y_pos = self.text_widget.yview()
-                self.text_widget.delete(1.0, tk.END)
-                self.text_widget.insert(tk.END, json.dumps(json_data, indent=2))
-                self.text_widget.yview_moveto(y_pos[0])
-            except Exception:
-                pass
+    def update_json(self, json_data: dict):
+        try:
+            tmp = self.OUTPUT_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(json_data, indent=2, ensure_ascii=False))
+            tmp.replace(self.OUTPUT_PATH)  # atomic replace
+        except Exception:
+            pass
 
 def generate_analysis_json(frame, all_detections, fps, frame_count, current_max_danger):
     """Generates a deterministic JSON matching the Master Prompt schema based on local data."""
@@ -1053,37 +1045,129 @@ def generate_analysis_json(frame, all_detections, fps, frame_count, current_max_
 # ==========================================
 # Main Simulator
 # ==========================================
-def main():
-    # Check video file
-    if not os.path.exists(VIDEO_PATH):
-        print(f"\n❌ ไม่พบไฟล์วิดีโอ: {VIDEO_PATH}")
-        print(f"   กรุณาวางไฟล์ walking_video.mp4 ไว้ที่: {Path(VIDEO_PATH).parent}")
-        return
+def _pick_video_source() -> tuple[str | int, str]:
+    """
+    Returns (source, label) where source is either:
+      - a file path (str)  → for video file
+      - 0 (int)            → for webcam
+    Uses osascript (macOS native) for GUI dialogs.
+    Falls back to interactive terminal prompt on non-macOS.
+    """
+    import sys
+    import subprocess
 
-    # Open video
-    cap = cv2.VideoCapture(VIDEO_PATH)
+    # ── macOS: use osascript (runs on any thread, no tkinter needed) ───────────
+    if sys.platform == "darwin":
+        try:
+            # Ask: file or webcam?
+            ask = subprocess.run(
+                [
+                    "osascript", "-e",
+                    'display dialog "ไม่พบ walking_video.mp4\\n\\nเลือกวิธีใช้งาน:" '
+                    'buttons {"Webcam", "เลือกไฟล์..."} '
+                    'default button "เลือกไฟล์..." '
+                    'with icon caution '
+                    'with title "AI Glasses — Video Simulator"',
+                ],
+                capture_output=True, text=True, timeout=60,
+            )
+            if ask.returncode != 0:
+                # User pressed Cancel or closed dialog
+                print("\nยกเลิก — ออกจากโปรแกรม")
+                sys.exit(0)
+
+            choice = ask.stdout.strip()
+
+            if "Webcam" in choice:
+                return 0, "Webcam"
+
+            # Open file picker
+            pick = subprocess.run(
+                [
+                    "osascript", "-e",
+                    'set f to choose file with prompt "เลือกไฟล์วิดีโอ" '
+                    'of type {"mp4", "mov", "avi", "mkv", "MOV", "MP4"} '
+                    'default location (POSIX file "' + str(Path(VIDEO_PATH).parent) + '")\n'
+                    'return POSIX path of f',
+                ],
+                capture_output=True, text=True, timeout=120,
+            )
+            if pick.returncode == 0 and pick.stdout.strip():
+                path = pick.stdout.strip()
+                return path, Path(path).name
+            # No file selected → webcam
+            print("ไม่ได้เลือกไฟล์ — ใช้ Webcam แทน")
+            return 0, "Webcam"
+
+        except subprocess.TimeoutExpired:
+            print("หมดเวลา — ใช้ Webcam แทน")
+            return 0, "Webcam"
+        except FileNotFoundError:
+            pass  # osascript not found, fall through to terminal
+
+    # ── Terminal fallback (Windows / Linux / no osascript) ────────────────────
+    print(f"\n❌ ไม่พบไฟล์วิดีโอ: {VIDEO_PATH}")
+    print("\nเลือกวิธีใช้งาน:")
+    print("  [1] ระบุ path ไฟล์วิดีโอด้วยตัวเอง")
+    print("  [2] ใช้ Webcam (กล้องหน้าจอ)")
+    print("  [Q] ออก")
+    while True:
+        ans = input("\nเลือก (1/2/Q): ").strip().upper()
+        if ans == "Q":
+            sys.exit(0)
+        elif ans == "1":
+            p = input("Path ไฟล์วิดีโอ: ").strip().strip('"').strip("'")
+            if os.path.exists(p):
+                return p, Path(p).name
+            print(f"❌ ไม่พบไฟล์: {p}")
+        elif ans == "2":
+            return 0, "Webcam"
+
+
+
+def main():
+    # ── Resolve video source ───────────────────────────────────────────────────
+    use_webcam = False
+    video_label = Path(VIDEO_PATH).name
+
+    if not os.path.exists(VIDEO_PATH):
+        source, video_label = _pick_video_source()
+        use_webcam = (source == 0)
+        video_source = source
+    else:
+        video_source = VIDEO_PATH
+
+    # Open video / webcam
+    cap = cv2.VideoCapture(video_source)
     if not cap.isOpened():
-        print(f"\n❌ ไม่สามารถเปิดวิดีโอ: {VIDEO_PATH}")
+        if use_webcam:
+            print("\n❌ ไม่สามารถเปิด Webcam ได้ กรุณาตรวจสอบว่ากล้องเชื่อมต่ออยู่")
+        else:
+            print(f"\n❌ ไม่สามารถเปิดวิดีโอ: {video_source}")
         return
 
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     video_fps = cap.get(cv2.CAP_PROP_FPS) or 30
-    total_seconds = total_frames / video_fps
+    total_seconds = total_frames / video_fps if total_frames > 0 else 0
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     frame_area = frame_width * frame_height
 
-    print(f"\n📹 วิดีโอ: {VIDEO_PATH}")
+    print(f"\n📹 แหล่งวิดีโอ: {video_label}")
     print(f"   ขนาด: {frame_width}x{frame_height}")
     print(f"   FPS: {video_fps:.1f}")
-    print(f"   ความยาว: {format_time(total_seconds)}")
-    print(f"   จำนวนเฟรม: {total_frames:,}")
+    if not use_webcam and total_frames > 0:
+        print(f"   ความยาว: {format_time(total_seconds)}")
+        print(f"   จำนวนเฟรม: {total_frames:,}")
+    else:
+        print("   โหมด: Live (Webcam)")
     print()
     print("🎮 ปุ่มควบคุม:")
     print("   [D] — บรรยายภาพ (Describe)")
     print("   [R] — อ่านข้อความ/ป้าย (Read/OCR)")
     print("   [F] — ค้นหาสิ่งของ (Find)")
     print("   [T] — ข้ามเวลา (Time Jump)")
+    print("   [V] — เริ่ม/หยุดบันทึกวิดีโอ (Record MP4)")
     print("   [Space] — หยุดชั่วคราว / เล่นต่อ")
     print("   [→] / [←] — กรอไปข้างหน้า/ย้อนกลับ 10 วินาที")
     print("   [+] / [-] — เพิ่ม/ลดความเร็ว")
@@ -1091,9 +1175,8 @@ def main():
     print()
     print("▶️  กำลังเริ่ม...\n")
 
-    # Start JSON Viewer Thread
-    json_viewer = JSONViewer()
-    threading.Thread(target=json_viewer.run, daemon=True).start()
+    # JSON output (file-based — no tkinter thread needed)
+    json_viewer = JSONFileWriter()
 
     # State variables
     paused = False
@@ -1109,23 +1192,82 @@ def main():
     fps_counter = 0
     fps_time = time.time()
     current_fps = 0
-    frame_skip = 0  # Process YOLO every N frames for speed
+    frame_skip = 0  # kept for compatibility
     frame_count = 0
-    cached_detections = []  # store last YOLO results for redraw on skipped frames
+    cached_detections = []
     tracker = ObjectTracker(history_len=APPROACH_HISTORY)
+    current_max_danger = 0
+    current_alert_text = ""
+    current_alert_speak = ""
+    current_danger_dir = ""
+
+
+    # ── Async YOLO thread (double-buffer) ─────────────────────────────────────
+    # YOLO runs in background thread; display loop uses last completed result.
+    # This decouples inference speed from display speed → max FPS.
+    import queue
+    _yolo_queue   = queue.Queue(maxsize=1)   # input frames (drop if busy)
+    _result_queue = queue.Queue(maxsize=1)   # completed detections
+    _yolo_running = threading.Event()
+    _yolo_running.set()
+
+    def _yolo_worker():
+        while _yolo_running.is_set():
+            try:
+                work_frame = _yolo_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            results = yolo_model(
+                work_frame,
+                conf=YOLO_CONFIDENCE,
+                iou=YOLO_IOU,
+                imgsz=YOLO_INPUT_SIZE,
+                max_det=YOLO_MAX_DET,
+                agnostic_nms=True,
+                verbose=False,
+            )
+            # Push result (drop old result if display hasn't consumed it yet)
+            try:
+                _result_queue.get_nowait()
+            except queue.Empty:
+                pass
+            _result_queue.put(results)
+
+    yolo_thread = threading.Thread(target=_yolo_worker, daemon=True)
+    yolo_thread.start()
+    # ─────────────────────────────────────────────────────────────────────────
 
     # Create window
     window_name = "AI Glasses Simulator"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 
-    # Resize window to a reasonable size
-    display_w = min(frame_width, 1280)
+    # Display resolution (draw on downscaled frame for speed)
+    display_w = min(frame_width, DISPLAY_WIDTH)
     display_h = int(display_w * frame_height / frame_width)
     cv2.resizeWindow(window_name, display_w, display_h)
+    display_scale = display_w / frame_width  # scale factor for box coords
+    # Initialize display_frame AFTER display_w/display_h are known
+    display_frame = np.zeros((display_h, display_w, 3), dtype=np.uint8)
 
     # Gemini task result (from background thread)
     gemini_result = {"text": "", "done": False}
     gemini_busy = False
+
+    # ── Video Recording ────────────────────────────────────────────────────────
+    video_writer   = None   # cv2.VideoWriter when recording
+    recording      = False
+    rec_start_time = 0.0
+    rec_frame_count = 0
+    REC_FPS = 25            # output FPS for recorded video
+    REC_FOURCC = cv2.VideoWriter_fourcc(*"mp4v")
+
+    def _start_recording():
+        from datetime import datetime
+        ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = str(Path(__file__).parent / f"demo_detection_{ts}.mp4")
+        writer = cv2.VideoWriter(path, REC_FOURCC, REC_FPS, (display_w, display_h))
+        print(f"\n🔴 REC เริ่มบันทึก → {path}")
+        return writer, path
 
     def gemini_task(frame_copy, prompt, result_dict):
         """Run Gemini in background thread"""
@@ -1142,49 +1284,44 @@ def main():
                 continue
 
             frame_count += 1
-            run_yolo = (frame_count % YOLO_PROCESS_EVERY == 0)
 
-            # -----------------------------------------------
-            # SYSTEM 1: YOLO Object Detection
-            # -----------------------------------------------
-            current_max_danger = 0
-            current_alert_text = ""
-            current_alert_speak = ""
-            current_danger_dir = ""
+            # ── Push frame to async YOLO worker (non-blocking) ─────────────────
+            try:
+                _yolo_queue.get_nowait()  # drop pending frame if worker is busy
+            except queue.Empty:
+                pass
+            _yolo_queue.put_nowait(frame)
 
-            if run_yolo:
-                results = yolo_model(
-                    frame, conf=YOLO_CONFIDENCE, iou=YOLO_IOU,
-                    imgsz=YOLO_INPUT_SIZE, verbose=False
-                )
+            # ── Pull latest YOLO result (non-blocking) ─────────────────────────
+            try:
+                yolo_results = _result_queue.get_nowait()
                 cached_detections = []
 
-                for result in results:
+                for result in yolo_results:
                     boxes = result.boxes
                     for box in boxes:
-                        # Extract box info
                         x1, y1, x2, y2 = map(int, box.xyxy[0])
                         conf = float(box.conf[0])
                         cls_id = int(box.cls[0])
                         label = yolo_model.names[cls_id]
 
-                        # Calculate properties
+                        # Scale coords to display frame
+                        dx1 = int(x1 * display_scale)
+                        dy1 = int(y1 * display_scale)
+                        dx2 = int(x2 * display_scale)
+                        dy2 = int(y2 * display_scale)
+
                         cx = (x1 + x2) / 2
                         cy = (y1 + y2) / 2
                         box_area = (x2 - x1) * (y2 - y1)
                         size_ratio = get_size_ratio(box_area, frame_area)
                         zone_th, zone_en = get_zone(cx, frame_width)
 
-                        # Track object across frames for approach detection
                         approach_rate = tracker.update(label, zone_en, size_ratio)
-
-                        # Assess danger (now uses approach detection!)
                         danger = assess_danger(label, zone_en, size_ratio, approach_rate)
 
-                        # Draw bounding box
-                        draw_detection_box(frame, x1, y1, x2, y2, label, conf, danger)
+                        cached_detections.append((dx1, dy1, dx2, dy2, label, conf, danger, approach_rate))
 
-                        # Track highest danger
                         if danger > current_max_danger:
                             current_max_danger = danger
                             thai_label = get_thai_label(label)
@@ -1209,72 +1346,79 @@ def main():
                                         current_alert_speak = f"ระวัง: {thai_label} ({zone_th}) ระยะ {dist_text}"
                             current_danger_dir = zone_en
 
-                        # -----------------------------------------------
-                        # SYSTEM 4: Find Mode — enhanced guidance
-                        # -----------------------------------------------
-                        if find_target and mode == "FINDING":
-                            if find_target.lower() in label.lower() or \
-                               find_target in get_thai_label(label):
-                                clock = get_clock_position(cx, cy, frame_width, frame_height)
-                                dist_text, dist_m = estimate_distance(size_ratio)
-                                guidance = get_walking_guidance(clock, dist_m)
-                                thai_label = get_thai_label(label)
+            except queue.Empty:
+                pass  # No new YOLO result yet — reuse cached_detections
 
-                                found_msg_th = (f"พบ{thai_label}! "
-                                             f"ตำแหน่ง {clock} นาฬิกา "
-                                             f"ระยะ{dist_text} "
-                                             f"({guidance})")
-                                found_msg_en = f">>> FOUND: {label.upper()} @ {clock} o'clock <<<"
-                                gemini_text = found_msg_en
-                                speak_thai(found_msg_th)
-                                print(f"\n🔎 {found_msg_th}\n")
-                                find_target = ""
-                                mode = "DETECTING"
+            # ── Draw cached detections on display frame ────────────────────────
+            # Downscale frame for drawing (much faster than drawing on 1080p)
+            display_frame = cv2.resize(frame, (display_w, display_h))
 
-                        # Cache detection for redraw on skipped frames
-                        cached_detections.append((x1, y1, x2, y2, label, conf, danger, approach_rate))
+            # Reset per-frame danger state (recalculate from cache)
+            current_max_danger = 0
+            current_alert_text = alert_text    # keep last alert until refreshed
+            current_alert_speak = alert_speak
 
-                # --- OpenCV Hole Detection (Running alongside YOLO) ---
-                detected_holes = detect_holes_opencv(frame)
-                for hx1, hy1, hx2, hy2 in detected_holes:
-                    label = "hole"
-                    conf = 0.85 # Mock confidence for UI
-                    
-                    hcx = (hx1 + hx2) / 2
-                    box_area = (hx2 - hx1) * (hy2 - hy1)
-                    size_ratio = get_size_ratio(box_area, frame_area)
-                    zone_th, zone_en = get_zone(hcx, frame_width)
-                    
-                    danger = assess_danger(label, zone_en, size_ratio)
-                    
-                    # Draw box (it will be drawn as DANGER/red)
-                    draw_detection_box(frame, hx1, hy1, hx2, hy2, label, conf, danger)
-                    
-                    if danger > current_max_danger:
-                        current_max_danger = danger
+            for (dx1, dy1, dx2, dy2, label, conf, danger, app_rate) in cached_detections:
+                draw_detection_box(display_frame, dx1, dy1, dx2, dy2, label, conf, danger)
+
+                if danger > current_max_danger:
+                    current_max_danger = danger
+
+                # Find mode: check if target found
+                if find_target and mode == "FINDING":
+                    if find_target.lower() in label.lower() or \
+                       find_target in get_thai_label(label):
+                        cx_norm = (dx1 + dx2) / 2 / display_w
+                        cy_norm = (dy1 + dy2) / 2 / display_h
+                        box_area = (dx2 - dx1) * (dy2 - dy1)
+                        size_ratio = get_size_ratio(box_area, display_w * display_h)
+                        clock = get_clock_position(cx_norm * display_w, cy_norm * display_h,
+                                                   display_w, display_h)
+                        dist_text, dist_m = estimate_distance(size_ratio)
+                        guidance = get_walking_guidance(clock, dist_m)
                         thai_label = get_thai_label(label)
-                        current_alert_text = f"DANGER! HOLE DETECTED ({zone_en})"
-                        current_alert_speak = f"ระวัง! {thai_label} ({zone_th})"
-                        current_danger_dir = zone_en
-                        
-                    cached_detections.append((hx1, hy1, hx2, hy2, label, conf, danger, 0.0))
+                        found_msg_th = (f"พบ{thai_label}! "
+                                        f"ตำแหน่ง {clock} นาฬิกา "
+                                        f"ระยะ{dist_text} ({guidance})")
+                        found_msg_en = f">>> FOUND: {label.upper()} @ {clock} o'clock <<<"
+                        gemini_text = found_msg_en
+                        speak_thai(found_msg_th)
+                        print(f"\n🔎 {found_msg_th}\n")
+                        find_target = ""
+                        mode = "DETECTING"
 
-            else:
-                # Skipped frame: redraw cached boxes only (no YOLO, much faster)
-                for (x1, y1, x2, y2, label, conf, danger, app_rate) in cached_detections:
-                    draw_detection_box(frame, x1, y1, x2, y2, label, conf, danger)
-                    if danger > current_max_danger:
-                        current_max_danger = danger
+            # ── Hole detection (OpenCV, fast) ──────────────────────────────────
+            detected_holes = detect_holes_opencv(frame)
+            for hx1, hy1, hx2, hy2 in detected_holes:
+                label = "hole"
+                conf  = 0.85
+                hcx   = (hx1 + hx2) / 2
+                box_area  = (hx2 - hx1) * (hy2 - hy1)
+                size_ratio = get_size_ratio(box_area, frame_area)
+                zone_th, zone_en = get_zone(hcx, frame_width)
+                danger = assess_danger(label, zone_en, size_ratio)
+                # Scale to display
+                dhx1 = int(hx1 * display_scale);  dhy1 = int(hy1 * display_scale)
+                dhx2 = int(hx2 * display_scale);  dhy2 = int(hy2 * display_scale)
+                draw_detection_box(display_frame, dhx1, dhy1, dhx2, dhy2, label, conf, danger)
+                if danger > current_max_danger:
+                    current_max_danger = danger
+                    thai_label = get_thai_label(label)
+                    current_alert_text = f"DANGER! HOLE DETECTED ({zone_en})"
+                    current_alert_speak = f"ระวัง! {thai_label} ({zone_th})"
+                    current_danger_dir = zone_en
+                cached_detections.append((dhx1, dhy1, dhx2, dhy2, label, conf, danger, 0.0))
 
-            # Update ego-motion baseline (MUST be called after all objects processed)
+            # ── Tracker updates ───────────────────────────────────────────────
             tracker.update_baseline()
-
-            # Cleanup stale tracks
             tracker.cleanup()
-            
-            # Generate and Update JSON Realtime
-            analysis_json = generate_analysis_json(frame, cached_detections, current_fps, frame_count, current_max_danger)
-            json_viewer.update_json(analysis_json)
+
+            # ── Throttled JSON write ───────────────────────────────────────────
+            if frame_count % JSON_WRITE_EVERY == 0:
+                analysis_json = generate_analysis_json(frame, cached_detections,
+                                                       current_fps, frame_count,
+                                                       current_max_danger)
+                json_viewer.update_json(analysis_json)
 
             # Update alert (with cooldown)
             now = time.time()
@@ -1293,12 +1437,10 @@ def main():
                 alert_speak = ""
                 alert_level = 0
 
-            # Draw zone lines
-            draw_zone_lines(frame)
-
-            # Draw danger indicators on edges
+            # Draw zone lines and danger indicators on display_frame
+            draw_zone_lines(display_frame)
             if current_danger_dir and current_max_danger >= 2:
-                draw_danger_indicator(frame, current_danger_dir, current_max_danger)
+                draw_danger_indicator(display_frame, current_danger_dir, current_max_danger)
 
         else:
             # Paused — keep showing last frame
@@ -1339,22 +1481,47 @@ def main():
         else:
             mode_text = "MODE: DETECTING"
 
-        draw_top_bar(frame, mode_text, current_fps, current_time, total_seconds, playback_speed)
-        draw_bottom_bar(frame, alert_text, alert_level, gemini_text)
+        draw_top_bar(display_frame, mode_text, current_fps, current_time, total_seconds, playback_speed)
+        draw_bottom_bar(display_frame, alert_text, alert_level, gemini_text)
 
-        # Show frame
-        cv2.imshow(window_name, frame)
+        # ── REC indicator ─────────────────────────────────────────────────────
+        if recording:
+            # Write frame to video
+            video_writer.write(display_frame)
+            rec_frame_count += 1
+            rec_elapsed = time.time() - rec_start_time
+            # Pulsing red dot (blinks every 0.5s)
+            if int(rec_elapsed * 2) % 2 == 0:
+                cv2.circle(display_frame, (display_w - 30, 30), 12, (0, 0, 220), -1)
+            cv2.putText(display_frame, f"REC {rec_elapsed:.0f}s",
+                        (display_w - 110, 38),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 220), 2, cv2.LINE_AA)
 
-        # -----------------------------------------------
-        # SYSTEM 5: Keyboard Controls
-        # -----------------------------------------------
-        wait_time = max(1, int((1000 / video_fps) / playback_speed)) if not paused else 50
-        key = cv2.waitKey(wait_time) & 0xFF
+        # Show frame (already at display resolution)
+        cv2.imshow(window_name, display_frame)
+
+        # waitKey=1 — timing controlled by YOLO thread speed, not artificial delay
+        key = cv2.waitKey(1) & 0xFF
 
         if key == ord('q') or key == ord('Q'):
             # Quit
             print("\n👋 ออกจากโปรแกรม")
             break
+
+        elif key == ord('v') or key == ord('V'):
+            # Toggle video recording
+            if not recording:
+                video_writer, rec_path = _start_recording()
+                recording = True
+                rec_start_time = time.time()
+                rec_frame_count = 0
+            else:
+                recording = False
+                video_writer.release()
+                video_writer = None
+                saved_sec = rec_frame_count / REC_FPS
+                print(f"\n⏹️  หยุดบันทึก — บันทึกแล้ว {saved_sec:.1f}s ({rec_frame_count} เฟรม)")
+                print(f"   ไฟล์อยู่ที่: {rec_path}")
 
         elif key == ord(' '):
             # Pause / Resume
@@ -1468,9 +1635,17 @@ def main():
             print(f"⏪ ความเร็ว: {playback_speed:.1f}x")
 
     # Cleanup
+    _yolo_running.clear()   # stop YOLO background thread
+    if recording and video_writer:
+        recording = False
+        video_writer.release()
+        saved_sec = rec_frame_count / REC_FPS
+        print(f"   ✅ บันทึกวิดีโออัตโนมัติ {saved_sec:.1f}s ({rec_frame_count} เฟรม) → {rec_path}")
     cap.release()
     cv2.destroyAllWindows()
     print("\n✅ ปิดโปรแกรมเรียบร้อย")
+
+
 
 
 if __name__ == "__main__":

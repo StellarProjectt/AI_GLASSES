@@ -1,7 +1,20 @@
-flask
-google-genai
-gTTS
-Pillow
-opencv-python
-ultralytics
-numpy
+# HomeSight — Python Server v3.0 Dependencies
+# All inference is local — NO cloud API packages required.
+
+# Web framework
+flask>=3.0
+
+# YOLO inference (choose ONE — both are listed so pip resolves correctly)
+ultralytics>=8.2.0        # Includes YOLOv8, handles .pt and .onnx models
+onnxruntime>=1.18.0       # Lightweight ONNX runtime (fallback / no GPU needed)
+
+# Offline TTS (no internet required)
+pyttsx3>=2.90
+
+# Image processing
+Pillow>=10.0
+numpy>=1.26
+
+# (Optional) ffmpeg-python for WAV resampling if pyttsx3 outputs wrong sample rate
+# ffmpeg-python>=0.2.0
+# NOTE: ffmpeg binary must also be installed: brew install ffmpeg

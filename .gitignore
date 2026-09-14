@@ -26,3 +26,18 @@ python_server/tts_cache/
 
 # Ignore artifacts
 *.jsonl
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Partial downloads
+*.part
+
+# Runtime outputs
+python_server/analysis_realtime.json
+python_server/analysis.json
+
+# Agent / IDE
+.agent/
+python_server/.agent/
