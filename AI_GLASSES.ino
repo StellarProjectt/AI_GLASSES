@@ -10,10 +10,12 @@
 #include <mbedtls/base64.h>
 
 // ==========================================
-// WiFi Credentials — change these
+// WiFi Credentials
 // ==========================================
-const char* WIFI_SSID = "Stellar";
-const char* WIFI_PASS = "11Stellar";
+// Defined in WifiCredentials.h (gitignored — not committed to source
+// control). Copy WifiCredentials.example.h to WifiCredentials.h and fill
+// in your real network name/password before building.
+#include "WifiCredentials.h"
 
 // ==========================================
 // Global State
@@ -29,6 +31,9 @@ unsigned long lastAutoDetectTime  = 0;
 unsigned long lastServerCheck     = 0;
 unsigned long lastBatteryCheck    = 0;
 unsigned long lastBatteryAlertMs  = 0;
+unsigned long lastWiFiRetry        = 0;
+unsigned long lastOfflineCueMs     = 0;
+int           consecutiveFailures  = 0;
 
 // Button edge detection
 bool         btnLastState         = HIGH;
@@ -744,9 +749,21 @@ void setup() {
     speakerReady = Audio.begin();
     if (speakerReady) Audio.playConfirmChirp();
 
+    // Battery
+    Battery.begin();
+
     // Camera
     cameraReady = Camera.begin();
     Serial.println(cameraReady ? "[OK] Camera" : "[FAIL] Camera");
+    if (!cameraReady && speakerReady) {
+        // Camera is required for every feature — a blind user has no other
+        // way to know it failed, so speak up rather than just logging.
+        Audio.playTone(300, 150, 0.5f);
+        delay(80);
+        Audio.playTone(300, 150, 0.5f);
+        delay(80);
+        Audio.playTone(300, 250, 0.5f);
+    }
 
     // WiFi
     if (Cloud.connectWiFi()) {
@@ -754,6 +771,7 @@ void setup() {
     } else {
         Serial.println("[!!] WiFi failed — starting AP mode");
         Cloud.startAP();
+        if (speakerReady) Audio.playTone(300, 150, 0.5f);
     }
 
     // Check local Python server
@@ -767,6 +785,7 @@ void setup() {
         Serial.println("   4.  python server.py");
         Serial.printf( "   5.  Set PYTHON_SERVER_IP in Config.h to your computer's IP\n");
         Serial.println("   (Retrying every 10 seconds)");
+        if (speakerReady) Audio.playTone(300, 150, 0.5f);
     }
 
     String ip = Cloud.getIP();
@@ -801,9 +820,10 @@ void loop() {
     unsigned long now = millis();
 
     // ─── Battery Monitor ────────────────────────────────────────────────────
+    Battery.update();  // internally rate-limited; cheap to call every loop
     if (now - lastBatteryCheck > BATTERY_CHECK_INTERVAL_MS) {
         lastBatteryCheck = now;
-        int battPct = Battery.getPercent();
+        int battPct = Battery.getPercentage();
         if (battPct > 0 && battPct <= BATTERY_LOW_PERCENT) {
             if (now - lastBatteryAlertMs > 60000) {   // max once per minute
                 lastBatteryAlertMs = now;
@@ -877,6 +897,20 @@ void loop() {
 
     btnLastState = btnCurrent;
 
+    // ─── WiFi Watchdog — reconnect if the link drops mid-session ────────────
+    // Without this, a WiFi blip left the device permanently unable to reach
+    // the server (no hazard detection at all) until manually power-cycled,
+    // with the user never told anything had changed.
+    if (!Cloud.isConnected() && (now - lastWiFiRetry > WIFI_RECONNECT_INTERVAL_MS)) {
+        lastWiFiRetry = now;
+        Serial.println("[WiFi] Link down — attempting reconnect...");
+        if (Cloud.connectWiFi()) {
+            Serial.println("[WiFi] Reconnected.");
+            Audio.playConfirmChirp();
+            serverReady = Cloud.checkServer();
+        }
+    }
+
     // ─── Auto Hazard Detection ───────────────────────────────────────────────
     // Runs every AUTO_DETECT_INTERVAL_MS (1500 ms with local YOLO server)
     if (cameraReady && serverReady && currentMode == MODE_DETECTING
@@ -889,8 +923,30 @@ void loop() {
             ServerResponse resp = Cloud.analyzeImage(fb);
             Camera.releaseFrame(fb);
 
-            if (resp.success) {
+            bool cycleOk = resp.success && resp.systemReady;
+            if (cycleOk) {
+                consecutiveFailures = 0;
                 Logic.processHazardResult(resp);
+            } else {
+                // A failed request (WiFi/server down, malformed reply) is
+                // indistinguishable from "path clear" to the user unless we
+                // say so out loud. Silence must only ever mean "server
+                // confirmed the path is clear", never "we couldn't check."
+                consecutiveFailures++;
+                if (!resp.success) {
+                    Serial.println("[LOGIC] ✗ /analyze failed — server unreachable or bad reply.");
+                    serverReady = false;  // force the retry-connection path below
+                } else if (!resp.systemReady) {
+                    Serial.println("[LOGIC] ✗ Server reachable but not ready (no model loaded).");
+                }
+                if (consecutiveFailures >= OFFLINE_CUE_FAILURE_COUNT &&
+                    (now - lastOfflineCueMs > OFFLINE_CUE_REPEAT_MS)) {
+                    lastOfflineCueMs = now;
+                    Serial.println("[LOGIC] ⚠ Hazard detection OFFLINE — alerting user.");
+                    Audio.playTone(300, 120, 0.5f);
+                    delay(60);
+                    Audio.playTone(300, 120, 0.5f);
+                }
             }
             if (resp.audioData)      free(resp.audioData);
             if (resp.clickAudioData) free(resp.clickAudioData);
@@ -905,6 +961,7 @@ void loop() {
             Serial.println("✅ HomeSight server connected!");
             Logic.addAlert("Server connected", PRIORITY_NORMAL);
             Audio.playConfirmChirp();
+            consecutiveFailures = 0;
         }
     }
 
