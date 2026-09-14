@@ -46,10 +46,12 @@ except ImportError:
 # Configuration
 # ==========================================
 VIDEO_PATH = str(Path(__file__).parent.parent / "walking_video.mp4")
-GEMINI_API_KEY = os.environ.get(
-    "GEMINI_API_KEY",
-    "AQ.Ab8RN6I4tBtQZHUaBX5-gjGDU6wOdIoBSWDUc-rSHhibHU5_iQ"
-)
+# Set your own key: `export GEMINI_API_KEY=...` before running this script.
+# A real key must never be hardcoded here — this file gets committed to git.
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_TIMEOUT_SEC = 15   # generate_content() has no default timeout otherwise,
+                          # so a network hiccup would hang Describe/Read/Find forever
+FIND_TIMEOUT_SEC = 15     # give up and say "not found" instead of waiting forever
 
 # YOLO settings
 YOLO_MODEL = "models/yolov8s.pt"  # small model — แม่นกว่า nano ~20%, mAP50=0.448
@@ -161,16 +163,21 @@ print("✅ YOLO11 พร้อมใช้งาน")
 # Initialize Gemini
 # ==========================================
 gemini_model = None
-try:
-    import google.generativeai as genai
-    from PIL import Image
+if not GEMINI_API_KEY:
+    print("⚠️  ไม่ได้ตั้งค่า GEMINI_API_KEY — ระบบบรรยายภาพ/OCR/ค้นหาของจะไม่ทำงาน")
+    print("   ตั้งค่าก่อนรัน: export GEMINI_API_KEY=your_key_here")
+    print("   YOLO (ตรวจจับสิ่งกีดขวาง) ยังใช้งานได้ตามปกติ")
+else:
+    try:
+        import google.generativeai as genai
+        from PIL import Image
 
-    genai.configure(api_key=GEMINI_API_KEY)
-    gemini_model = genai.GenerativeModel("gemini-3.6-flash")
-    print("✅ Gemini Flash พร้อมใช้งาน")
-except Exception as e:
-    print(f"⚠️  Gemini ไม่พร้อม: {e}")
-    print("   ระบบบรรยายภาพ/OCR จะไม่ทำงาน แต่ YOLO ยังใช้ได้")
+        genai.configure(api_key=GEMINI_API_KEY)
+        gemini_model = genai.GenerativeModel("gemini-3.6-flash")
+        print("✅ Gemini Flash พร้อมใช้งาน")
+    except Exception as e:
+        print(f"⚠️  Gemini ไม่พร้อม: {e}")
+        print("   ระบบบรรยายภาพ/OCR จะไม่ทำงาน แต่ YOLO ยังใช้ได้")
 
 # ==========================================
 # Initialize TTS (optional)
@@ -686,7 +693,12 @@ def call_gemini(frame, prompt):
             generation_config=genai.types.GenerationConfig(
                 max_output_tokens=200,
                 temperature=0.3,
-            )
+            ),
+            # Without an explicit timeout a network hiccup hangs this call
+            # forever — since it runs in a background thread with no way to
+            # cancel it, gemini_busy would stay stuck and Describe/Read/Find
+            # would silently stop responding to button presses.
+            request_options={"timeout": GEMINI_TIMEOUT_SEC},
         )
         return response.text.strip()
     except Exception as e:
@@ -1189,6 +1201,7 @@ def main():
     last_alert_time = 0
     last_gemini_time = 0
     find_target = ""
+    find_start_time = 0.0
     fps_counter = 0
     fps_time = time.time()
     current_fps = 0
@@ -1275,13 +1288,26 @@ def main():
         result_dict["text"] = result
         result_dict["done"] = True
 
+    consecutive_read_failures = 0
     while True:
         if not paused:
             ret, frame = cap.read()
             if not ret:
-                # Loop back to start
+                if use_webcam:
+                    # A webcam read failure means it disconnected/was unplugged,
+                    # not "end of video" — resetting CAP_PROP_POS_FRAMES does
+                    # nothing for a live device, so without this the loop spins
+                    # at 100% CPU forever instead of reporting the problem.
+                    consecutive_read_failures += 1
+                    if consecutive_read_failures > 30:
+                        print("\n❌ Webcam หลุดการเชื่อมต่อ — ออกจากโปรแกรม")
+                        break
+                    time.sleep(0.1)
+                    continue
+                # End of video file — loop back to start
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 continue
+            consecutive_read_failures = 0
 
             frame_count += 1
 
@@ -1386,6 +1412,19 @@ def main():
                         print(f"\n🔎 {found_msg_th}\n")
                         find_target = ""
                         mode = "DETECTING"
+
+            # Find mode timeout — without this, an object that never appears
+            # in frame leaves the user waiting in total silence forever with
+            # no feedback that the search even ran.
+            if mode == "FINDING" and find_target and \
+                    (time.time() - find_start_time) > FIND_TIMEOUT_SEC:
+                not_found_th = f"ยังไม่พบ{get_thai_label(find_target)}ในตอนนี้"
+                not_found_en = f">>> NOT FOUND: {find_target.upper()} <<<"
+                print(f"\n🔎 {not_found_th}\n")
+                gemini_text = not_found_en
+                speak_thai(not_found_th)
+                find_target = ""
+                mode = "DETECTING"
 
             # ── Hole detection (OpenCV, fast) ──────────────────────────────────
             detected_holes = detect_holes_opencv(frame)
@@ -1569,6 +1608,7 @@ def main():
                 target = input().strip()
                 if target:
                     find_target = target
+                    find_start_time = time.time()
                     mode = "FINDING"
                     print(f"   กำลังค้นหา: {target}")
                     # Also ask Gemini to look in current frame
