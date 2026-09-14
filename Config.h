@@ -99,6 +99,20 @@ extern const char* WIFI_PASS;
 #define BATTERY_LOW_PERCENT      15
 #define BATTERY_CHECK_INTERVAL_MS 10000
 
+// Motion detection (CameraMod::analyzeMotion) — JPEG byte-sample comparison
+#define MOTION_THRESHOLD         15    // Per-sample byte delta considered "changed"
+#define MOTION_PERCENT_ALERT     20.0f // % of samples changed to flag motion
+
+// WiFi reconnect — retry this often if the link drops mid-session
+#define WIFI_RECONNECT_INTERVAL_MS 15000
+
+// Consecutive /analyze failures (WiFi down, server down/unreachable, or
+// server explicitly not ready) before we play a periodic "offline" cue so
+// the user knows hazard detection has stopped, instead of staying silent
+// as if the path were clear.
+#define OFFLINE_CUE_FAILURE_COUNT   3
+#define OFFLINE_CUE_REPEAT_MS       20000
+
 // ==========================================
 // 6. System State Machine
 // ==========================================

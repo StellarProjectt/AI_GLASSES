@@ -101,7 +101,7 @@ ServerResponse CloudAPI::sendImage(
     const String& extraField,
     const String& extraValue
 ) {
-    ServerResponse resp = {false, false, "", "", 0, "", 0.0f, nullptr, 0, nullptr, 0, 0.0f};
+    ServerResponse resp = {false, true, false, "", "", 0, "", 0.0f, nullptr, 0, nullptr, 0, 0.0f};
     if (!isConnected() || !fb) return resp;
 
     HTTPClient http;
@@ -156,15 +156,22 @@ ServerResponse CloudAPI::sendImage(
     String payload = http.getString();
     http.end();
 
-    DynamicJsonDocument doc(16384);
+    // A combined earcon+speech WAV (~1.5-2s @ 16kHz/16-bit) base64-encodes to
+    // roughly 60-90 KB — a fixed 16 KB document silently failed to parse on
+    // essentially every real hazard alert (NoMemory), which meant detected
+    // hazards never reached the user as audio. Size to the actual payload.
+    size_t jsonCapacity = payload.length() + 8192;
+    DynamicJsonDocument doc(jsonCapacity);
     DeserializationError err = deserializeJson(doc, payload);
     if (err) {
-        Serial.printf("[API] JSON parse error: %s\n", err.c_str());
+        Serial.printf("[API] JSON parse error (%u bytes, cap %u): %s\n",
+                       payload.length(), jsonCapacity, err.c_str());
         return resp;
     }
 
     resp.success = true;
     resp.elapsed = doc["elapsed"] | 0.0f;
+    resp.systemReady = doc["system_ready"] | true;
 
     // /analyze response
     if (doc.containsKey("alert")) {

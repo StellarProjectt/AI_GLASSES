@@ -12,6 +12,8 @@
 // ─────────────────────────────────────────────
 struct ServerResponse {
     bool     success;
+    bool     systemReady;     // false → server has no model loaded / not ready
+                               // (distinct from "path clear" — must not stay silent)
     bool     hasAlert;        // true → hazard detected (play audio)
     String   message;         // Prompt string: "Watch head — cabinet"
     String   earconCode;      // "HIGH" | "LOW" | "DIR" | ""
