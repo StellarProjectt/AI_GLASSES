@@ -1,70 +1,75 @@
-# 👓 คู่มือและอธิบายโครงสร้างระบบ (Walkthrough)
+# 👓 HomeSight — Implementation Walkthrough (v3.0)
 
-โปรเจกต์ **แว่น AI ช่วยผู้พิการทางการมองเห็น** ได้ถูกออกแบบและเขียนโค้ดเสร็จสมบูรณ์แล้วในโฟลเดอร์ `scratch/AI_Glasses_ESP32` โครงสร้างทั้งหมดถูกออกแบบมาเพื่อให้คุณนำไปคอมไพล์ด้วย Arduino IDE ได้ทันที
+## What Changed
 
-## 📌 โครงสร้างไฟล์ทั้งหมด (Modular Architecture)
+Upgraded from cloud-dependent AI Glasses prototype to a fully **offline HomeSight MVP** conforming to PRD v1.0.
 
-โค้ดถูกแบ่งออกเป็น 8 ส่วนหลักตามที่คุณต้องการ เพื่อให้สามารถดูแลรักษาและต่อยอดได้ง่าย:
+## Architecture
 
-1. **`Config.h`**: เก็บการตั้งค่าทั้งหมด เช่น รหัส Wi-Fi, API Key, การกำหนดขา (Pins) ของฮาร์ดแวร์, และสถานะของระบบ (State Machine)
-2. **`BatteryMod`**: จัดการการอ่านค่าแรงดันแบตเตอรี่ผ่านขา ADC (Pin 5) และคำนวณเปอร์เซ็นต์
-3. **`CameraMod`**: ตั้งค่าและดึงภาพจากกล้อง OV2640 ที่อยู่บนบอร์ด ESP32-S3 Sense
-4. **`AudioMod`**: ควบคุมโมดูลขยายเสียง MAX98357A ผ่านโปรโตคอล I2S เพื่อส่งเสียงพูดออกทางลำโพง
-5. **`MicMod`**: จัดการไมโครโฟนบนบอร์ดผ่าน I2S เพื่อบันทึกเสียงผู้ใช้
-6. **`CloudAPI`**: ส่วนสำคัญที่รับผิดชอบการเชื่อมต่อ Wi-Fi และพูดคุยกับ **Google Cloud (Vision, STT, TTS)**
-7. **`AppLogic`**: ระบบตรรกะที่คิดคำนวณระยะทางจากขนาดวัตถุ (Bounding Box), จัดลำดับความสำคัญ (คน > บันได > วัตถุใกล้ > วัตถุทั่วไป), การป้องกันการแจ้งเตือนซ้ำซ้อนภายใน 8 วินาที, และโหมดค้นหาสิ่งของ
-8. **`AI_Glasses_ESP32.ino`**: ไฟล์แกนกลางที่นำทุกโมดูลมารวมกัน และใช้ **FreeRTOS** เพื่อรันงานแยกกันสองคอร์ (Core 0: เช็คแบตเตอรี่, Core 1: กล้อง, เสียง, และ AI)
+```
+[ OV3660 Camera ]  ── WiFi LAN (no internet) ──►  [ Mac/PC Python Server ]
+                                                        YOLOv8n (local)
+                                                        HazardClassifier
+                                                        P0 / P1 / P2 / Silent
+                                                        pyttsx3 WAV cache
+                                                   ◄──────────────────────
+[ AppLogic — Priority Arbitration ]
+  P0 preempts all → earcon HIGH + speech
+  P1 cooldown gate → earcon LOW + speech
+  P2 directional  → earcon DIR + speech
+  NORMAL          → total silence
+       │
+[ I2S → MAX98357A → Open-Ear / Bone-Conduction ]
+```
 
----
+## Files Changed
 
-## ⚡ การทำงานของ FreeRTOS และ State Machine
+### Python Server
+- `server.py` — REWRITTEN: offline YOLO, /analyze + /describe + /search
+- `hazard_classifier.py` — NEW: 4-tier matrix + prompt grammar
+- `audio_cache.py` — NEW: pre-rendered WAV cache + earcon synthesis
+- `models/download_model.py` — NEW: one-time YOLOv8n downloader
+- `requirements.txt` — UPDATED: removed cloud SDKs, added ultralytics/pyttsx3
+- `test_hazard_classifier.py` — NEW: 30 unit tests (all passed ✅)
+- `benchmark_latency.py` — NEW: P99 latency vs PRD KPIs
 
-ระบบมีการทำงานแบบ Real-time โดยใช้ FreeRTOS ช่วยแบ่ง Task ไม่ให้ระบบค้างเวลารอภาพจากอินเทอร์เน็ต:
+### ESP32 Firmware
+- `AI_GLASSES.ino` — REWRITTEN: double-tap, 1.5s scan, HomeSight dashboard
+- `Config.h` — UPDATED: P0/P1/P2 thresholds, cooldowns, new modes
+- `AppLogic.h/.cpp` — REWRITTEN: priority arbitration + DoubleTapDetector
+- `AudioMod.h/.cpp` — REWRITTEN: P0/P1/P2 earcons, WAV feed, proximity clicks
+- `CloudAPI.h/.cpp` — UPDATED: new response fields, /search endpoint
 
-- **`TaskBattery` (Core 0)**: ตรวจสอบแบตเตอรี่ทุกๆ 10 วินาที หากแบตเตอรี่ต่ำกว่า 15% จะแจ้งเตือนด้วยเสียงทันที (และจะเตือนซ้ำทุกๆ 1 นาทีจนกว่าแบตจะหมด)
-- **`TaskMainLogic` (Core 1)**: ทำงานหลักโดยใช้ State Machine ดังนี้:
-  - **`MODE_STANDBY`**: ระบบจะรอรับคำสั่ง ไม่ส่งภาพขึ้นเน็ต (ประหยัดเน็ต/แบต)
-  - **`MODE_DETECTING`**: โหมดปกติ กล้องจะถ่ายภาพและส่งขึ้น Cloud เพื่อดูวัตถุด้านหน้า จากนั้นโยนเข้า `AppLogic` เพื่อแจ้งเตือนหากมีสิ่งกีดขวาง
-  - **`MODE_SEARCHING`**: คล้ายโหมดตรวจจับ แต่จะโฟกัสหาเป้าหมายที่ผู้ใช้สั่ง ("หากุญแจ", "หากระเป๋า") 
-  - **`MODE_READING_OCR`**: ทำงานเพียง 1 ครั้ง (One-shot) ถ่ายภาพส่งไปทำ OCR ภาษาไทย แล้วนำข้อความกลับมาอ่านออกเสียง จากนั้นกลับไปโหมด Detecting
+## PRD Compliance
 
----
+| Requirement | Implementation |
+|---|---|
+| Silence by default | Empty hazard list → zero audio |
+| P0 Head < 1.2m | cy<0.60 + dist<1.2m → HIGH earcon |
+| P1 Floor 0.8-1.8m | bottom>0.55 + range → LOW earcon |
+| P2 Dynamic < 1.5m | person/pet → DIR earcon |
+| Sub-300ms latency | LAN YOLO ~80ms + cached WAV ~5ms |
+| Double-tap locator | 400ms window, /search endpoint |
+| No cloud dependency | 100% local YOLOv8n + pyttsx3 |
 
-## 🔧 การต่อวงจร (Wiring Diagram)
+## Setup
 
-> [!IMPORTANT]
-> กรุณาต่อวงจรตามนี้อย่างระมัดระวัง หากต่อไฟผิดขั้วอาจทำให้บอร์ดเสียหายได้
+```bash
+cd python_server
+pip install -r requirements.txt
+python models/download_model.py
+python server.py
+```
 
-- **ESP32-S3 Sense**: บอร์ดหลัก
-- **MAX98357A (โมดูลลำโพง)**:
-  - `VIN` -> ต่อ 5V หรือ 3.3V ของบอร์ด
-  - `GND` -> ต่อ GND
-  - `DIN` -> ต่อเข้ากับ Pin `43` (ตั้งค่าใน Config.h ได้)
-  - `BCLK` -> ต่อเข้ากับ Pin `44`
-  - `LRC` -> ต่อเข้ากับ Pin `45`
-- **ปุ่มกดรับคำสั่งเสียง (Action Button)**:
-  - ขาข้างหนึ่งต่อเข้ากับ Pin `4`
-  - ขาอีกข้างต่อลง `GND` (โค้ดใช้ `INPUT_PULLUP` จึงไม่ต้องต่อตัวต้านทานเพิ่ม)
-- **สวิตช์หลัก (Power Switch)**: 
-  - ต่อคั่นระหว่างขั้วบวกของแบตเตอรี่ก่อนเข้าบอร์ด ESP32 เพื่อตัดไฟ 100%
-  - *หรือ* หากใช้สวิตช์แบบ Logic ในการเข้า Sleep Mode ให้ต่อเข้า Pin `15` กับ `GND`
-- **การวัดแบตเตอรี่ (Battery Monitor)**:
-  - ใช้ Voltage Divider (ตัวต้านทาน 100k Ω สองตัวต่ออนุกรมกัน) เพื่อแบ่งแรงดันจาก 4.2V ให้ไม่เกิน 3.3V แล้วลากสายจุดกึ่งกลางเข้า Pin `5` (ADC)
+Set `PYTHON_SERVER_IP` in `Config.h` to your computer's local IP, then upload to ESP32.
 
----
+## Test Results
 
-## 🛠️ วิธีการติดตั้งและคอมไพล์ (Arduino IDE)
+30/30 unit tests passed in 0.03s ✅
 
-1. เปิด Arduino IDE ไปที่ **File -> Preferences** และเพิ่ม URL บอร์ด ESP32
-2. ไปที่ **Tools -> Board -> Boards Manager** พิมพ์ `esp32` แล้วกด Install
-3. เลือกบอร์ดเป็น **ESP32S3 Dev Module** (หรือชื่อบอร์ดที่ตรงกับของคุณ)
-4. เปิด **Library Manager** (Tools -> Manage Libraries) และติดตั้ง:
-   - `ArduinoJson` (โดย Benoit Blanchon) สำหรับจัดการข้อมูล JSON จาก Cloud
-5. ไปที่ไฟล์ `AI_Glasses_ESP32.ino` ตรงบรรทัดที่ 10-12 กรุณาเปลี่ยน:
-   - `WIFI_SSID` (ชื่อ Wi-Fi หรือ Hotspot ของคุณ)
-   - `WIFI_PASS` (รหัสผ่าน Wi-Fi)
-   - `GCP_API_KEY` (คีย์ Google Cloud Platform สำหรับใช้ Vision/Speech API)
-6. กดปุ่ม **Upload**
-
-> [!TIP]
-> โค้ดปัจจุบันมีการ "Mock (จำลอง)" การสร้าง HTTP Request และการเข้ารหัส Base64 ของไฟล์ภาพ/เสียง เอาไว้ในไฟล์ `CloudAPI.cpp` เล็กน้อย เพื่อให้คุณนำไปทดสอบ Logic ของระบบก่อนนำไปต่อยอดเสียค่าบริการ Google Cloud API จริงๆ คุณสามารถดูตรงคอมเมนต์ `// Mock implementation` ในไฟล์นั้นเพื่อนำไลบรารี HTTPClient มาเชื่อมต่อกับ REST API จริงในอนาคตครับ
+## Phase 2 Backlog
+- Wire VL53L1X ToF sensor for real depth
+- MicMod + Whisper-tiny for Object Locator voice queries
+- Fine-tune YOLOv8n on home-specific objects
+- Validate false alarm rate < 8% with 100-frame neutral test set
+- Bone-conduction transducer assembly
