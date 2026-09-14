@@ -1,25 +1,36 @@
 #!/usr/bin/env python3
 """
-HomeSight — YOLOv8n Model Downloader
+HomeSight — YOLOv8 Model Downloader
 =====================================
-Downloads the YOLOv8n ONNX model for offline local inference.
+Downloads a YOLOv8 ONNX model for offline local inference.
 Run once before starting the server:
 
     python models/download_model.py
 
-The model (~6 MB) is saved to python_server/models/yolov8n.onnx
+Default: yolov8s ("small", ~22 MB) — meaningfully more accurate than the
+nano model at a CPU-latency cost that's still fine on a desktop/laptop.
+For slower hardware (or to match server.py's env-var override), request
+the nano model instead:
+
+    MODEL_SIZE=n python models/download_model.py
 """
 import os, sys, urllib.request, hashlib
 from pathlib import Path
 
+MODEL_SIZE = os.environ.get("MODEL_SIZE", "s").strip().lower()
+if MODEL_SIZE not in ("n", "s", "m"):
+    print(f"Unknown MODEL_SIZE '{MODEL_SIZE}' — expected n (nano), s (small), or m (medium).")
+    sys.exit(1)
+
+MODEL_NAME = f"yolov8{MODEL_SIZE}"
 MODEL_DIR  = Path(__file__).parent
-ONNX_PATH  = MODEL_DIR / "yolov8n.onnx"
+ONNX_PATH  = MODEL_DIR / f"{MODEL_NAME}.onnx"
+PT_PATH    = MODEL_DIR / f"{MODEL_NAME}.pt"
 # Official Ultralytics release asset
-ONNX_URL   = "https://github.com/ultralytics/assets/releases/download/v8.3.0/yolov8n.pt"
-PT_PATH    = MODEL_DIR / "yolov8n.pt"
+ONNX_URL   = f"https://github.com/ultralytics/assets/releases/download/v8.3.0/{MODEL_NAME}.pt"
 
 def download_pt():
-    print(f"Downloading YOLOv8n weights → {PT_PATH} ...")
+    print(f"Downloading {MODEL_NAME} weights → {PT_PATH} ...")
     def progress(count, block, total):
         done = count * block
         pct  = min(100, int(done * 100 / total)) if total > 0 else 0
@@ -29,13 +40,13 @@ def download_pt():
     print()
 
 def export_to_onnx():
-    print("Exporting YOLOv8n → ONNX (requires ultralytics) ...")
+    print(f"Exporting {MODEL_NAME} → ONNX (requires ultralytics) ...")
     try:
         from ultralytics import YOLO
         model = YOLO(str(PT_PATH))
         model.export(format="onnx", imgsz=640, dynamic=False, simplify=True)
         # ultralytics saves alongside the .pt file
-        exported = PT_PATH.parent / "yolov8n.onnx"
+        exported = PT_PATH.parent / f"{MODEL_NAME}.onnx"
         if exported.exists():
             exported.rename(ONNX_PATH)
             print(f"  Saved: {ONNX_PATH}")
@@ -51,4 +62,5 @@ if __name__ == "__main__":
         sys.exit(0)
     download_pt()
     export_to_onnx()
-    print("\nDone! You can now start the server.")
+    print(f"\nDone! Set MODEL_PATH=models/{MODEL_NAME}.onnx (or MODEL_PATH_PT=models/{MODEL_NAME}.pt) "
+          f"if this isn't server.py's current default, then start the server.")
