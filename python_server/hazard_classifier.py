@@ -253,11 +253,12 @@ def build_prompt(priority: HazardPriority, label: str, side: str) -> str:
 def classify(
     detections: list[dict],
     frame_shape: Tuple[int, int],
-    conf_threshold: float = 0.40,
+    conf_threshold: float = 0.35,
     p0_dist_threshold: float = 1.2,
     p1_dist_near: float = 0.8,
     p1_dist_far: float = 1.8,
     p2_dist_threshold: float = 2.5,
+    conf_threshold_p0: Optional[float] = None,
 ) -> List[Hazard]:
     """
     Classify YOLO detections into HomeSight hazards.
@@ -273,21 +274,31 @@ def classify(
               }
             }
         frame_shape: (height, width) of the frame in pixels.
-        conf_threshold: minimum YOLO confidence to process.
+        conf_threshold: minimum YOLO confidence to process (P1/P2).
         p0_dist_threshold: distance limit (m) for P0 alerts.
         p1_dist_near / p1_dist_far: distance range for P1 alerts.
         p2_dist_threshold: distance limit (m) for P2 alerts.
+        conf_threshold_p0: minimum confidence for head-level hazards. Missing
+            a P0 alert is worse than an extra one, so this defaults to a
+            looser bar than conf_threshold if not given explicitly.
 
     Returns:
         List of Hazard objects sorted by priority descending (P0 first).
         Empty list means SAFE / MUTE — no audio output.
     """
     frame_h, frame_w = frame_shape
+    if frame_h <= 0 or frame_w <= 0:
+        return []
+
+    if conf_threshold_p0 is None:
+        conf_threshold_p0 = min(conf_threshold, 0.28)
+    conf_floor = min(conf_threshold, conf_threshold_p0)
+
     hazards: List[Hazard] = []
 
     for det in detections:
         conf = float(det.get("confidence", 0))
-        if conf < conf_threshold:
+        if conf < conf_floor:
             continue
 
         raw_label = str(det.get("name", "")).lower().strip()
@@ -319,6 +330,12 @@ def classify(
         if priority == HazardPriority.NORMAL:
             continue
 
+        # Per-priority confidence gate, applied after classification since
+        # P0 needs the loosest bar and P1/P2 the normal one.
+        min_conf = conf_threshold_p0 if priority == HazardPriority.P0 else conf_threshold
+        if conf < min_conf:
+            continue
+
         prompt = build_prompt(priority, raw_label, side)
         if not prompt:
             continue
@@ -336,12 +353,16 @@ def classify(
     # Sort: highest priority first, then closest distance
     hazards.sort(key=lambda h: (-h.priority.value, h.est_dist_m or 99.0))
 
-    # De-duplicate: keep only the most critical hazard per prompt to prevent spam
-    seen_prompts: set[str] = set()
+    # De-duplicate by (priority, label, side) rather than the rendered prompt
+    # text — two P2 prompts both render as "Person passing" regardless of
+    # side, so a person on the left AND a person on the right would
+    # otherwise collapse into one alert and silently hide the second threat.
+    seen: set[tuple] = set()
     unique: List[Hazard] = []
     for h in hazards:
-        if h.prompt not in seen_prompts:
-            seen_prompts.add(h.prompt)
+        key = (h.priority, h.label, h.side)
+        if key not in seen:
+            seen.add(key)
             unique.append(h)
 
     return unique
@@ -372,6 +393,25 @@ def _resolve_priority(
     is_p0_class   = label in _P0_CLASSES
     is_p0_partial = any(p in label for p in ["door", "cabinet", "shelf", "lamp", "light", "fixture"])
     if (is_p0_class or is_p0_partial) and dist < p0_dist and is_head_level(bbox_norm):
+        return HazardPriority.P0
+
+    # Class-agnostic P0 catch-all: a stock COCO-trained detector has no
+    # "open door" / "ajar cabinet" class at all (those aren't COCO
+    # categories), so is_p0_class/is_p0_partial above can only ever fire for
+    # a handful of COCO labels (fridge, microwave, tv, laptop, umbrella).
+    # Without this, almost nothing ever triggers a head-level warning — the
+    # single most dangerous hazard category (PRD: risk of head/face injury)
+    # would be effectively disabled. Any recognised object that is large
+    # (i.e. close) AND centred at head height still deserves a warning
+    # regardless of what YOLO calls it.
+    # Slightly wider than p0_dist: a head-hazard detector with essentially
+    # no true "hazard" classes to rely on needs more warning runway on the
+    # one signal it does have (bbox size), not less — a named P0 class still
+    # uses the tighter p0_dist above.
+    _, _, box_w, box_h = bbox_norm
+    if (dist < p0_dist * 1.4 and is_head_level(bbox_norm)
+            and box_w * box_h > 0.12
+            and label not in _SAFE_CLASSES):
         return HazardPriority.P0
 
     # ── P1: Floor obstacle (chair, fan, box …) ────────────────────────────────

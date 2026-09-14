@@ -5,7 +5,7 @@ HomeSight — Python Server v3.0 (Offline Edge Inference)
 100% offline — zero cloud API dependency.
 
 Inference stack:
-  YOLOv8n (ONNX / ultralytics)  →  hazard_classifier  →  audio_cache (pyttsx3 WAV)
+  YOLOv8s (ONNX / ultralytics)  →  hazard_classifier  →  audio_cache (pyttsx3 WAV)
 
 Endpoints:
   POST /analyze   — Auto hazard detection (continuous, every 1.5 s from ESP32)
@@ -36,7 +36,7 @@ Usage:
 
 import os, io, sys, time, base64, struct, math, logging, traceback
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Tuple
 from flask import Flask, request, jsonify, send_file
 
 # ── HomeSight modules ──────────────────────────────────────────────────────────
@@ -53,9 +53,19 @@ if sys.platform == "win32":
 # ─────────────────────────────────────────────
 SERVER_PORT       = int(os.environ.get("SERVER_PORT", "5001"))
 DEBUG_MODE        = os.environ.get("DEBUG_MODE", "true").lower() == "true"
-CONF_THRESHOLD    = float(os.environ.get("CONF_THRESHOLD", "0.40"))
-MODEL_PATH        = os.environ.get("MODEL_PATH", "models/yolov8n.onnx")
-MODEL_PATH_PT     = os.environ.get("MODEL_PATH_PT", "models/yolov8n.pt")
+CONF_THRESHOLD    = float(os.environ.get("CONF_THRESHOLD", "0.35"))
+# yolov8s ("small") is meaningfully more accurate than the nano model at a
+# real but acceptable CPU-latency cost on a desktop/laptop server — worth it
+# for a device whose whole job is not walking a blind user into things.
+# Set MODEL_PATH/MODEL_PATH_PT to the yolov8n files (or run
+# `MODEL_SIZE=n python models/download_model.py`) to trade accuracy back
+# for speed on slower hardware.
+MODEL_PATH        = os.environ.get("MODEL_PATH", "models/yolov8s.onnx")
+MODEL_PATH_PT     = os.environ.get("MODEL_PATH_PT", "models/yolov8s.pt")
+# P0 head-level hazards are the most dangerous class (PRD: risk of head/face
+# injury) — accept more false positives there in exchange for fewer missed
+# detections. Everything else keeps the normal threshold.
+CONF_THRESHOLD_P0  = float(os.environ.get("CONF_THRESHOLD_P0", "0.28"))
 
 # ─────────────────────────────────────────────
 # Logging
@@ -66,6 +76,59 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("HomeSight")
+
+# ─────────────────────────────────────────────
+# COCO-80 class names (standard order used by every YOLOv8 COCO checkpoint).
+# Needed only by the raw-onnxruntime fallback path, which has no access to
+# the ultralytics model metadata that normally supplies these.
+# ─────────────────────────────────────────────
+COCO_CLASSES = [
+    "person","bicycle","car","motorcycle","airplane","bus","train","truck","boat",
+    "traffic light","fire hydrant","stop sign","parking meter","bench","bird","cat",
+    "dog","horse","sheep","cow","elephant","bear","zebra","giraffe","backpack",
+    "umbrella","handbag","tie","suitcase","frisbee","skis","snowboard","sports ball",
+    "kite","baseball bat","baseball glove","skateboard","surfboard","tennis racket",
+    "bottle","wine glass","cup","fork","knife","spoon","bowl","banana","apple",
+    "sandwich","orange","broccoli","carrot","hot dog","pizza","donut","cake","chair",
+    "couch","potted plant","bed","dining table","toilet","tv","laptop","mouse",
+    "remote","keyboard","cell phone","microwave","oven","toaster","sink",
+    "refrigerator","book","clock","vase","scissors","teddy bear","hair drier",
+    "toothbrush",
+]
+
+
+def _nms(boxes: "np.ndarray", scores: "np.ndarray", cls_ids: "np.ndarray",
+         iou_threshold: float = 0.45) -> list[int]:
+    """
+    Minimal numpy class-aware Non-Max Suppression.
+    Without this, the raw-onnxruntime path emits many overlapping boxes for
+    the same physical object (YOLO predicts one box per anchor point), which
+    would otherwise spam multiple hazard alerts for a single obstacle.
+    Returns indices of kept boxes.
+    """
+    import numpy as np
+    if len(boxes) == 0:
+        return []
+    x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+    areas = np.maximum(0, x2 - x1) * np.maximum(0, y2 - y1)
+    order = scores.argsort()[::-1]
+    keep = []
+    while order.size > 0:
+        i = order[0]
+        keep.append(int(i))
+        rest = order[1:]
+        same_class = cls_ids[rest] == cls_ids[i]
+        xx1 = np.maximum(x1[i], x1[rest])
+        yy1 = np.maximum(y1[i], y1[rest])
+        xx2 = np.minimum(x2[i], x2[rest])
+        yy2 = np.minimum(y2[i], y2[rest])
+        inter = np.maximum(0, xx2 - xx1) * np.maximum(0, yy2 - yy1)
+        union = areas[i] + areas[rest] - inter
+        iou = np.where(union > 0, inter / union, 0)
+        suppress = same_class & (iou > iou_threshold)
+        order = rest[~suppress]
+    return keep
+
 
 # ─────────────────────────────────────────────
 # YOLO Model Loading
@@ -124,12 +187,17 @@ def _run_inference(image_bytes: bytes) -> tuple[list[dict], tuple[int,int]]:
         return [], frame_shape
 
     if model_type == "ultralytics":
-        results = yolo_model.predict(
-            source=img,
-            conf=CONF_THRESHOLD,
-            verbose=False,
-            imgsz=640,
-        )
+        # Run inference at the lowest threshold any downstream consumer
+        # needs (P0 head hazards use a lower bar than the general default)
+        # — classify() re-filters per-category afterwards, so we never lose
+        # a real detection to an overly strict threshold applied too early.
+        with _inference_lock:
+            results = yolo_model.predict(
+                source=img,
+                conf=min(CONF_THRESHOLD, CONF_THRESHOLD_P0),
+                verbose=False,
+                imgsz=640,
+            )
         detections = []
         if results:
             for r in results:
@@ -149,39 +217,65 @@ def _run_inference(image_bytes: bytes) -> tuple[list[dict], tuple[int,int]]:
 
     # onnxruntime path (more involved — resize + normalise)
     import numpy as np
-    inp_size  = 640
-    img_resized = img.resize((inp_size, inp_size))
-    inp = np.array(img_resized, dtype=np.float32) / 255.0
+    inp_size = 640
+
+    # Letterbox (pad to square, keep aspect ratio) instead of a naive
+    # stretch-resize — stretching distorts every object's proportions,
+    # which measurably hurts a detector's accuracy (and this classifier's
+    # own bbox-area distance estimate assumes undistorted geometry).
+    scale = min(inp_size / img.width, inp_size / img.height)
+    new_w, new_h = int(round(img.width * scale)), int(round(img.height * scale))
+    resized = img.resize((new_w, new_h))
+    pad_x, pad_y = (inp_size - new_w) // 2, (inp_size - new_h) // 2
+    canvas = PILImage.new("RGB", (inp_size, inp_size), (114, 114, 114))
+    canvas.paste(resized, (pad_x, pad_y))
+
+    inp = np.array(canvas, dtype=np.float32) / 255.0
     inp = inp.transpose(2, 0, 1)[np.newaxis]   # NCHW
 
     input_name  = yolo_model.get_inputs()[0].name
     output_name = yolo_model.get_outputs()[0].name
-    raw_out = yolo_model.run([output_name], {input_name: inp})[0]
+    with _inference_lock:
+        raw_out = yolo_model.run([output_name], {input_name: inp})[0]
 
     # YOLOv8 ONNX output: [1, 84, 8400] — (cx,cy,w,h, cls×80)
-    detections = []
     preds = raw_out[0].T  # [8400, 84]
-    for pred in preds:
-        scores = pred[4:]
-        cls_id = int(np.argmax(scores))
-        conf   = float(scores[cls_id])
-        if conf < CONF_THRESHOLD:
-            continue
-        cx, cy, w, h = pred[:4]
-        # Convert from inp_size coords to original pixel coords
-        scale_x = img.width  / inp_size
-        scale_y = img.height / inp_size
-        x1 = (cx - w / 2) * scale_x
-        y1 = (cy - h / 2) * scale_y
-        x2 = (cx + w / 2) * scale_x
-        y2 = (cy + h / 2) * scale_y
-        # COCO names (simplified — load from model metadata in production)
-        from ultralytics.data.utils import DATASETS  # may not exist in onnx-only env
-        name = str(cls_id)  # fallback
+    conf_floor = min(CONF_THRESHOLD, CONF_THRESHOLD_P0)
+    all_scores = preds[:, 4:]
+    cls_ids    = all_scores.argmax(axis=1)
+    confs      = all_scores[np.arange(len(preds)), cls_ids]
+    mask       = confs >= conf_floor
+    if not np.any(mask):
+        return [], frame_shape
+
+    boxes_cxcywh = preds[mask, :4]
+    cls_ids      = cls_ids[mask]
+    confs        = confs[mask]
+
+    # Undo letterbox padding/scaling to get back to original pixel coords
+    cx, cy, w, h = boxes_cxcywh[:, 0], boxes_cxcywh[:, 1], boxes_cxcywh[:, 2], boxes_cxcywh[:, 3]
+    x1 = (cx - w / 2 - pad_x) / scale
+    y1 = (cy - h / 2 - pad_y) / scale
+    x2 = (cx + w / 2 - pad_x) / scale
+    y2 = (cy + h / 2 - pad_y) / scale
+    boxes_xyxy = np.stack([x1, y1, x2, y2], axis=1)
+
+    keep = _nms(boxes_xyxy, confs, cls_ids)
+
+    detections = []
+    for i in keep:
+        cid = int(cls_ids[i])
+        name = COCO_CLASSES[cid] if 0 <= cid < len(COCO_CLASSES) else str(cid)
+        bx1, by1, bx2, by2 = boxes_xyxy[i]
         detections.append({
             "name": name,
-            "confidence": conf,
-            "box": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
+            "confidence": float(confs[i]),
+            "box": {
+                "x1": float(max(0, min(bx1, img.width))),
+                "y1": float(max(0, min(by1, img.height))),
+                "x2": float(max(0, min(bx2, img.width))),
+                "y2": float(max(0, min(by2, img.height))),
+            },
         })
     return detections, frame_shape
 
@@ -198,7 +292,8 @@ def _build_description(detections: list[dict], frame_shape: tuple) -> str:
     No LLM required — purely rule-based to maintain offline constraint.
     Max 3 sentences; hazards listed first.
     """
-    hazards = classify(detections, frame_shape, CONF_THRESHOLD)
+    hazards = classify(detections, frame_shape, CONF_THRESHOLD,
+                        conf_threshold_p0=CONF_THRESHOLD_P0)
     all_objs = [
         d for d in detections
         if float(d.get("confidence", 0)) >= CONF_THRESHOLD
@@ -238,32 +333,87 @@ def _build_description(detections: list[dict], frame_shape: tuple) -> str:
 # Object Locator
 # ─────────────────────────────────────────────
 
-def _find_object(query: str, detections: list[dict], frame_shape: tuple) -> Optional[str]:
+import re as _re
+
+_STOPWORDS = {
+    "a", "an", "the", "my", "find", "where", "is", "are", "locate",
+    "search", "for", "please", "can", "you", "me", "i", "lost", "of",
+}
+
+def _tokenize(s: str) -> set[str]:
+    return set(_re.findall(r"[a-z]+", s.lower()))
+
+# Reverse of hazard_classifier._FRIENDLY_LABELS (coco name -> friendly word),
+# plus natural-language aliases people actually say that aren't in that map.
+def _build_synonyms() -> dict[str, set[str]]:
+    from hazard_classifier import _FRIENDLY_LABELS
+    syn: dict[str, set[str]] = {}
+    for coco_name, friendly in _FRIENDLY_LABELS.items():
+        for tok in _tokenize(friendly):
+            syn.setdefault(tok, set()).add(coco_name)
+    extra = {
+        "phone": {"cell phone"}, "mobile": {"cell phone"},
+        "seat": {"chair"}, "sofa": {"couch"},
+        "television": {"tv"}, "screen": {"tv", "laptop"},
+        "bag": {"backpack", "handbag", "suitcase"}, "purse": {"handbag"},
+        "glass": {"wine glass", "cup"}, "computer": {"laptop"},
+        "drier": {"hair drier"}, "dryer": {"hair drier"},
+        "fridge": {"refrigerator"}, "remote control": {"remote"},
+    }
+    for tok, names in extra.items():
+        syn.setdefault(tok, set()).update(names)
+    return syn
+
+_SYNONYMS = _build_synonyms()
+
+
+def _find_object(
+    query: str, detections: list[dict], frame_shape: tuple
+) -> Tuple[Optional[str], Optional[dict]]:
     """
-    Find the closest matching detection to the user's voice query.
-    Returns a relative-position string, e.g. "On the table, right side."
-    Returns None if not found.
+    Find the best-matching detection for the user's query.
+    Returns (relative-position string, the matched detection dict) so the
+    caller can reuse the exact same detection for proximity-click distance
+    instead of re-matching (and possibly picking a different object).
+    Returns (None, None) if nothing plausible is in view.
+
+    Matching is whole-word, not substring — the previous implementation used
+    `q in name` for each query word, so a short word like "a" (contained in
+    "chair", "table", "lamp", ...) would match almost anything in the room
+    and hand back a confident-sounding but essentially random object.
     """
-    query_lc = query.lower().strip()
-    best = None
-    best_conf = 0.0
+    query_tokens = _tokenize(query) - _STOPWORDS
+    if not query_tokens:
+        return None, None
+
+    from hazard_classifier import _FRIENDLY_LABELS
+
+    best_score = 0
+    best_conf  = 0.0
+    best_det   = None
 
     for d in detections:
-        name = d["name"].lower()
+        name = str(d.get("name", "")).lower()
         conf = float(d.get("confidence", 0))
-        # Fuzzy match: query word contained in name or vice versa
-        if query_lc in name or name in query_lc or any(
-            q in name for q in query_lc.split()
-        ):
-            if conf > best_conf:
-                best_conf = conf
-                best = d
+        name_tokens = _tokenize(name) | _tokenize(_FRIENDLY_LABELS.get(name, ""))
 
-    if best is None:
-        return None
+        if query_tokens & name_tokens:
+            score = 2  # direct match against the class name or its friendly label
+        elif any(name in _SYNONYMS.get(tok, ()) for tok in query_tokens):
+            score = 1  # matched via a natural-language synonym
+        else:
+            continue
+
+        if score > best_score or (score == best_score and conf > best_conf):
+            best_score = score
+            best_conf  = conf
+            best_det   = d
+
+    if best_det is None:
+        return None, None
 
     from hazard_classifier import get_side, estimate_distance
-    box  = best["box"]
+    box  = best_det["box"]
     fh, fw = frame_shape
     cx = ((box["x1"] + box["x2"]) / 2) / fw
     cy = ((box["y1"] + box["y2"]) / 2) / fh
@@ -280,8 +430,9 @@ def _find_object(query: str, detections: list[dict], frame_shape: tuple) -> Opti
     else:
         dist_str = "further back"
 
-    name_str = best["name"].capitalize()
-    return f"{name_str} — {side_str}, {dist_str}."
+    fl = _FRIENDLY_LABELS.get(best_det["name"].lower(), best_det["name"])
+    name_str = fl.capitalize()
+    return f"{name_str} — {side_str}, {dist_str}.", best_det
 
 
 def _generate_proximity_clicks(distance_norm: float) -> bytes:
@@ -315,26 +466,42 @@ def _generate_proximity_clicks(distance_norm: float) -> bytes:
 # ─────────────────────────────────────────────
 # Flask App
 # ─────────────────────────────────────────────
+import threading
+
 app = Flask(__name__)
+# ESP32 sends small JPEGs (VGA/QVGA at moderate quality — tens of KB). Cap
+# uploads generously above that so a corrupt/runaway request can't consume
+# unbounded memory/CPU; Flask returns 413 automatically past this.
+app.config["MAX_CONTENT_LENGTH"] = 4 * 1024 * 1024  # 4 MB
+
 _server_start_time = time.time()
 _req_counter       = 0
 _latency_history   = []   # rolling list of total latencies (ms)
+_stats_lock        = threading.Lock()
+
+# Most inference runtimes (ultralytics/onnxruntime) aren't guaranteed
+# thread-safe for concurrent calls on one model instance, and Flask runs
+# threaded — serialize inference so the ESP32's /analyze polling and a
+# simultaneous web-dashboard /describe or /search never race each other.
+_inference_lock = threading.Lock()
 
 def _req_id() -> str:
     global _req_counter
-    _req_counter += 1
-    return f"REQ-{_req_counter:04d}"
+    with _stats_lock:
+        _req_counter += 1
+        return f"REQ-{_req_counter:04d}"
 
 def _record_latency(ms: float):
-    _latency_history.append(ms)
-    if len(_latency_history) > 200:
-        _latency_history.pop(0)
+    with _stats_lock:
+        _latency_history.append(ms)
+        if len(_latency_history) > 200:
+            _latency_history.pop(0)
 
 def _p99_latency() -> float:
-    if not _latency_history:
-        return 0.0
-    import statistics
-    s = sorted(_latency_history)
+    with _stats_lock:
+        if not _latency_history:
+            return 0.0
+        s = sorted(_latency_history)
     idx = int(len(s) * 0.99)
     return s[min(idx, len(s) - 1)]
 
@@ -356,6 +523,49 @@ def health():
         "p99_ms":       round(_p99_latency(), 1),
         "wav_spec":     f"{SAMPLE_RATE}Hz/16bit/mono",
     })
+
+
+# ─────────────────────────────────────────────
+# Temporal confirmation — smooths single-frame misdetections
+# ─────────────────────────────────────────────
+from collections import deque
+
+_RECENT_FRAMES = 2  # plus the current frame = "seen in >=2 of last 3"
+_recent_hazard_keys: "deque" = deque(maxlen=_RECENT_FRAMES)
+_confirm_lock = threading.Lock()
+
+
+def _confirm_hazards(hazards: list) -> list:
+    """
+    Require a P1/P2 hazard to appear in at least 2 of the last 3 /analyze
+    frames (this one plus the 2 before it) before it's allowed through.
+    /analyze runs on a live, noisy camera every 1.5s — a single misread
+    frame (motion blur, bad angle, a momentary misclassification) would
+    otherwise become a spoken alert immediately, which reads as the system
+    being inaccurate/trigger-happy even when the underlying detector is
+    working as intended.
+
+    P0 head-level hazards are exempt and always fire on the first frame:
+    for the one category where missing a hit really matters, a half-second
+    of extra caution is worse than the false-alarm cost of firing once on a
+    misdetection.
+    """
+    key = lambda h: (h.priority, h.label, h.side)
+    current_keys = {key(h) for h in hazards if h.priority != HazardPriority.P0}
+
+    with _confirm_lock:
+        prior_sets = list(_recent_hazard_keys)
+        _recent_hazard_keys.append(current_keys)
+
+    confirmed = []
+    for h in hazards:
+        if h.priority == HazardPriority.P0:
+            confirmed.append(h)
+            continue
+        seen_in_prior = sum(1 for s in prior_sets if key(h) in s)
+        if seen_in_prior >= 1:
+            confirmed.append(h)
+    return confirmed
 
 
 # ─────────────────────────────────────────────
@@ -385,6 +595,18 @@ def analyze():
     if "image" not in request.files:
         return jsonify({"error": "No image provided", "req_id": rid}), 400
 
+    # A model that failed to load must never look like "path is clear" —
+    # that's indistinguishable from a genuinely safe scene to the user, who
+    # would otherwise walk around trusting hazard detection that isn't
+    # actually running. Say so explicitly instead.
+    if yolo_model is None:
+        elapsed = time.time() - t0
+        logger.error(f"[{rid}] No model loaded — refusing to claim 'clear'.")
+        return jsonify({
+            "alert": False, "system_ready": False,
+            "elapsed": round(elapsed, 3), "req_id": rid,
+        })
+
     t_upload = time.time()
     image_data = request.files["image"].read()
     upload_ms  = (time.time() - t_upload) * 1000
@@ -397,13 +619,22 @@ def analyze():
     except Exception as e:
         logger.error(f"[{rid}] Inference error: {e}")
         logger.debug(traceback.format_exc())
-        return jsonify({"alert": False, "error": "inference_failed", "req_id": rid})
+        return jsonify({"alert": False, "system_ready": False,
+                         "error": "inference_failed", "req_id": rid})
     inf_ms = (time.time() - t_inf) * 1000
     logger.debug(f"[{rid}] Inference: {len(detections)} detections in {inf_ms:.0f}ms")
 
     # ── Hazard Classification ──────────────────────────────────────────────────
     t_cls = time.time()
-    hazards = classify(detections, frame_shape, CONF_THRESHOLD)
+    try:
+        hazards = classify(detections, frame_shape, CONF_THRESHOLD,
+                            conf_threshold_p0=CONF_THRESHOLD_P0)
+    except Exception as e:
+        logger.error(f"[{rid}] Classification error: {e}")
+        logger.debug(traceback.format_exc())
+        return jsonify({"alert": False, "system_ready": False,
+                         "error": "classify_failed", "req_id": rid})
+    hazards = _confirm_hazards(hazards)
     cls_ms  = (time.time() - t_cls) * 1000
 
     elapsed = time.time() - t0
@@ -474,15 +705,20 @@ def describe():
     if "image" not in request.files:
         return jsonify({"error": "No image", "req_id": rid}), 400
 
+    if yolo_model is None:
+        return jsonify({"description": "Detection is not running — check the server.",
+                         "system_ready": False, "req_id": rid})
+
     image_data = request.files["image"].read()
 
     try:
         detections, frame_shape = _run_inference(image_data)
+        description = _build_description(detections, frame_shape)
     except Exception as e:
-        logger.error(f"[{rid}] Inference error: {e}")
+        logger.error(f"[{rid}] /describe failed: {e}")
+        logger.debug(traceback.format_exc())
         return jsonify({"description": "Cannot analyse image — try again.", "req_id": rid})
 
-    description = _build_description(detections, frame_shape)
     logger.info(f"[{rid}] Description: \"{description}\"")
 
     audio_wav = audio_cache.get_speech(description)
@@ -526,16 +762,19 @@ def search():
         return jsonify({"error": "No query provided", "req_id": rid}), 400
     if "image" not in request.files:
         return jsonify({"error": "No image", "req_id": rid}), 400
+    if yolo_model is None:
+        return jsonify({"found": False, "message": "Detection is not running.",
+                         "system_ready": False, "req_id": rid})
 
     image_data = request.files["image"].read()
 
     try:
         detections, frame_shape = _run_inference(image_data)
+        location, matched_det = _find_object(query, detections, frame_shape)
     except Exception as e:
-        logger.error(f"[{rid}] Inference error: {e}")
+        logger.error(f"[{rid}] /search failed: {e}")
+        logger.debug(traceback.format_exc())
         return jsonify({"found": False, "message": "Cannot analyse image.", "req_id": rid})
-
-    location = _find_object(query, detections, frame_shape)
 
     if location is None:
         msg = f"Cannot find {query} in view."
@@ -545,20 +784,21 @@ def search():
             audio = _synth_with_pyttsx3(msg)
         result = {"found": False, "message": msg, "req_id": rid}
     else:
-        # Estimate normalised distance for click tone
+        # Distance for the click tone comes from the SAME detection the
+        # message describes — previously this re-matched independently with
+        # a looser substring check, so the click cadence could describe a
+        # different object than the one just named out loud.
         best_dist = 0.5   # default mid-range
-        for d in detections:
-            if d["name"].lower() in query.lower() or query.lower() in d["name"].lower():
-                box = d["box"]
-                fh, fw = frame_shape
-                cx = ((box["x1"] + box["x2"]) / 2) / fw
-                cy = ((box["y1"] + box["y2"]) / 2) / fh
-                w  = (box["x2"] - box["x1"]) / fw
-                h  = (box["y2"] - box["y1"]) / fh
-                from hazard_classifier import estimate_distance
-                dist_m = estimate_distance((cx, cy, w, h))
-                best_dist = min(1.0, dist_m / 3.0)
-                break
+        if matched_det is not None:
+            box = matched_det["box"]
+            fh, fw = frame_shape
+            cx = ((box["x1"] + box["x2"]) / 2) / fw
+            cy = ((box["y1"] + box["y2"]) / 2) / fh
+            w  = (box["x2"] - box["x1"]) / fw
+            h  = (box["y2"] - box["y1"]) / fh
+            from hazard_classifier import estimate_distance
+            dist_m = estimate_distance((cx, cy, w, h))
+            best_dist = min(1.0, dist_m / 3.0)
 
         speech_wav = audio_cache.get_speech(location)
         if speech_wav is None:
@@ -630,7 +870,7 @@ if __name__ == "__main__":
     print()
     print("=" * 62)
     print("  HomeSight — Python Server v3.0  (Offline Edge Inference)")
-    print("  YOLOv8n + pyttsx3 | Zero cloud dependency")
+    print("  YOLOv8s + pyttsx3 | Zero cloud dependency")
     print("=" * 62)
     print()
 
