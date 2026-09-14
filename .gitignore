@@ -41,3 +41,6 @@ python_server/analysis.json
 # Agent / IDE
 .agent/
 python_server/.agent/
+
+# Secrets — never commit real WiFi credentials
+WifiCredentials.h

@@ -15,6 +15,7 @@ import io
 import struct
 import math
 import logging
+import subprocess
 import threading
 from typing import Optional
 
@@ -70,6 +71,7 @@ ALERT_PROMPTS: list[str] = [
     "Connected",
     "Ready",
 ]
+ALERT_PROMPTS_SET = frozenset(ALERT_PROMPTS)
 
 # ─────────────────────────────────────────────
 # WAV / PCM Utilities
@@ -189,24 +191,48 @@ def _synth_with_macos_say(text: str) -> Optional[bytes]:
         return None
 
 
+# pyttsx3 is not safe to call concurrently or re-init repeatedly — doing so
+# is a well-known source of hangs/crashes (SAPI5/espeak driver state gets
+# corrupted). We keep one persistent engine, serialize every call through a
+# lock, and bound the wait so a stuck engine degrades a single request
+# instead of stalling the whole Flask thread pool (which would eventually
+# also starve /analyze hazard polling).
+_tts_engine = None
+_tts_lock = threading.Lock()
+_TTS_LOCK_TIMEOUT_S = 8.0
+
+
+def _get_tts_engine():
+    global _tts_engine
+    if _tts_engine is None:
+        import pyttsx3
+        _tts_engine = pyttsx3.init()
+        _tts_engine.setProperty("rate", 190)
+        _tts_engine.setProperty("volume", 0.95)
+        voices = _tts_engine.getProperty("voices")
+        for v in voices:
+            if "english" in v.name.lower() or "en" in (v.id or "").lower():
+                _tts_engine.setProperty("voice", v.id)
+                break
+    return _tts_engine
+
+
 def _synth_with_pyttsx3(text: str) -> Optional[bytes]:
     """
     Synthesise speech offline using pyttsx3.
     Returns WAV PCM bytes (16 kHz / 16-bit / mono) or None on failure.
     """
+    global _tts_engine
+
+    if not _tts_lock.acquire(timeout=_TTS_LOCK_TIMEOUT_S):
+        logger.warning(f"[TTS] pyttsx3 busy (previous call still running) — "
+                        f"skipping synthesis for: '{text}'")
+        return None
+
     try:
-        import pyttsx3
         import tempfile, os
 
-        engine = pyttsx3.init()
-        engine.setProperty("rate", 190)
-        engine.setProperty("volume", 0.95)
-
-        voices = engine.getProperty("voices")
-        for v in voices:
-            if "english" in v.name.lower() or "en" in (v.id or "").lower():
-                engine.setProperty("voice", v.id)
-                break
+        engine = _get_tts_engine()
 
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             tmp_path = tmp.name
@@ -217,11 +243,20 @@ def _synth_with_pyttsx3(text: str) -> Optional[bytes]:
         with open(tmp_path, "rb") as f:
             data = f.read()
         os.unlink(tmp_path)
+
+        if not data or len(data) < 44:
+            raise RuntimeError("pyttsx3 produced no audio")
+
         return _resample_wav_if_needed(data)
 
     except Exception as e:
         logger.debug(f"pyttsx3 synthesis failed: {e}")
+        # The engine may be left in a broken state — drop it so the next
+        # call builds a fresh one instead of repeating the same failure.
+        _tts_engine = None
         return None
+    finally:
+        _tts_lock.release()
 
 
 def _synth_with_gtts(text: str) -> Optional[bytes]:
@@ -302,8 +337,15 @@ class AudioCache:
     Call `warmup()` once at server startup (runs in background thread).
     """
 
+    # Cap on dynamically-synthesised phrases (scene descriptions, search
+    # results are free text — every unique one would otherwise be cached
+    # forever, growing without bound on a device meant to run continuously).
+    # The fixed ALERT_PROMPTS set is always kept regardless of this cap.
+    _MAX_DYNAMIC_ENTRIES = 200
+
     def __init__(self):
-        self._cache: dict[str, bytes] = {}
+        from collections import OrderedDict
+        self._cache: "OrderedDict[str, bytes]" = OrderedDict()
         self._earcons: dict[str, bytes] = {}
         self._lock = threading.Lock()
         self._ready = False
@@ -346,6 +388,22 @@ class AudioCache:
 
         logger.info(f"[AudioCache] Ready — {ok}/{len(ALERT_PROMPTS)} phrases cached.")
 
+    def _cache_put(self, phrase: str, wav: bytes) -> None:
+        """Insert into the cache, evicting the oldest dynamic (non-fixed)
+        entry once the dynamic-entry cap is exceeded."""
+        with self._lock:
+            self._cache[phrase] = wav
+            self._cache.move_to_end(phrase)
+            dynamic_count = sum(1 for k in self._cache if k not in ALERT_PROMPTS_SET)
+            while dynamic_count > self._MAX_DYNAMIC_ENTRIES:
+                for k in self._cache:
+                    if k not in ALERT_PROMPTS_SET:
+                        del self._cache[k]
+                        dynamic_count -= 1
+                        break
+                else:
+                    break
+
     def get_speech(self, phrase: str) -> Optional[bytes]:
         """
         Return pre-rendered WAV bytes for the given phrase.
@@ -353,6 +411,8 @@ class AudioCache:
         """
         with self._lock:
             cached = self._cache.get(phrase)
+            if cached:
+                self._cache.move_to_end(phrase)
         if cached:
             return cached
 
@@ -360,8 +420,7 @@ class AudioCache:
         logger.warning(f"[AudioCache] Cache miss, synthesising: '{phrase}'")
         wav = _synth_speech(phrase)
         if wav:
-            with self._lock:
-                self._cache[phrase] = wav
+            self._cache_put(phrase, wav)
         return wav
 
     def get_earcon(self, code: str) -> bytes:

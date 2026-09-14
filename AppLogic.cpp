@@ -203,6 +203,35 @@ int AppLogic::getProximityClickFreq(float distanceNorm) const {
 }
 
 // ─────────────────────────────────────────────
+// JSON string escaping — hazard labels/descriptions are free text and can
+// contain quotes or control characters, which would otherwise produce
+// malformed JSON and break the dashboard's fetch(...).json() calls.
+// ─────────────────────────────────────────────
+static String _jsonEscape(const String& s) {
+    String out;
+    out.reserve(s.length() + 8);
+    for (size_t i = 0; i < s.length(); i++) {
+        char c = s[i];
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if ((uint8_t)c < 0x20) {
+                    char buf[7];
+                    snprintf(buf, sizeof(buf), "\\u%04x", c);
+                    out += buf;
+                } else {
+                    out += c;
+                }
+        }
+    }
+    return out;
+}
+
+// ─────────────────────────────────────────────
 // getStatusJSON — for web dashboard /status endpoint
 // ─────────────────────────────────────────────
 String AppLogic::getStatusJSON(SystemMode mode, bool serverOk) const {
@@ -227,7 +256,7 @@ String AppLogic::getStatusJSON(SystemMode mode, bool serverOk) const {
     String json = "{";
     json += "\"mode\":\""         + modeStr + "\",";
     json += "\"serverOk\":"       + String(serverOk ? "true" : "false") + ",";
-    json += "\"lastMessage\":\""  + _lastMessage + "\",";
+    json += "\"lastMessage\":\""  + _jsonEscape(_lastMessage) + "\",";
     json += "\"lastPriority\":\""  + priStr + "\",";
     json += "\"alertCount\":"     + String(_alertCount) + ",";
     json += "\"uptime\":"         + String(millis() / 1000);
@@ -252,7 +281,7 @@ String AppLogic::getAlertHistoryJSON() const {
             default:          priStr = "INFO"; break;
         }
         json += "{";
-        json += "\"msg\":\""    + _alerts[idx].message + "\",";
+        json += "\"msg\":\""    + _jsonEscape(_alerts[idx].message) + "\",";
         json += "\"priority\":\"" + priStr + "\",";
         json += "\"danger\":"   + String(_alerts[idx].isDanger ? "true" : "false") + ",";
         json += "\"t\":"        + String(_alerts[idx].timestamp / 1000);
